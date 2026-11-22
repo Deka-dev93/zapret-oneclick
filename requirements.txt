@@ -1,0 +1,4 @@
+cryptography>=42
+httpx[http2]
+certifi
+pillow>=10
