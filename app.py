@@ -19,6 +19,7 @@ try:  # чёткое окно на экранах с масштабом >100% (�
 except Exception:
     pass
 
+import diag
 import engine
 from gfx import GfxMixin, ease_out, hex2rgb, mix
 from tgproxy import TgProxy
@@ -63,7 +64,8 @@ def relaunch_as_admin():
 
 
 class App(GfxMixin, tk.Tk):
-    PAGES = [("home", "Главная"), ("tg", "Telegram"), ("log", "Журнал"), ("set", "Настройки")]
+    PAGES = [("home", "Главная"), ("tg", "Telegram"), ("diag", "Диагностика"),
+             ("log", "Журнал"), ("set", "Настройки")]
 
     def __init__(self):
         super().__init__()
@@ -102,6 +104,13 @@ class App(GfxMixin, tk.Tk):
         self.regions, self.hover, self.pressed = [], None, None
         self.set_info = {}
         self._refresh_set_info()
+        self.toasts: list = []
+        self.dl_busy = False
+        self.diag_items: list = []
+        self.diag_verdict = None
+        self.diag_running = False
+        self.diag_stage = ""
+        self.diag_off = 0
 
         # анимация
         self.bg = None
@@ -125,6 +134,7 @@ class App(GfxMixin, tk.Tk):
         self.cv.bind("<ButtonPress-1>", self._press)
         self.cv.bind("<ButtonRelease-1>", self._release)
         self.cv.bind("<Leave>", lambda e: self._set_hover(None))
+        self.cv.bind("<MouseWheel>", self._wheel)
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.after(50, self._pump)
         self.after(3000, self._watch)
@@ -168,7 +178,8 @@ class App(GfxMixin, tk.Tk):
         dt = min(0.05, now - self.last_t)
         self.last_t = now
         moving = self.tw_step(dt)
-        live = (self.on or self.busy) and self.page == "home"
+        live = ((self.on or self.busy) and self.page == "home") or bool(self.toasts) \
+            or (self.diag_running and self.page == "diag")
         if self.bg is not None and (self.dirty or moving or self.fade or live):
             self._draw(now)
             self.dirty = False
@@ -206,6 +217,7 @@ class App(GfxMixin, tk.Tk):
             box = (int(mx1 * S) + 2, int(my1 * S) + 2, int(mx2 * S) - 2, int(my2 * S) - 2)
             new = self.fr.crop(box)
             self.fr.paste(Image.blend(self.fade[1].crop(box), new, e), box[:2])
+        self._draw_toasts(now, W)
         self._upload()
         self.last_fr = self.fr
 
@@ -545,7 +557,8 @@ class App(GfxMixin, tk.Tk):
         self.txt(x1 + 22, c1 + 94, f"Стратегий: {info['n']}   ·   Игровой фильтр: {info['mode']}   ·   "
                                    f"Целей проверки: {info['targets']}", 9, INK4)
         self.button(x1 + 22, c1 + 122, x1 + 190, c1 + 154, "Выбрать папку…", self._pick_dir, "pick", "ghost", 9)
-        self.button(x1 + 202, c1 + 122, x1 + 420, c1 + 154, "Скачать свежий zapret", self._download, "dl", "ghost", 9)
+        self.button(x1 + 202, c1 + 122, x1 + 420, c1 + 154,
+                    "Скачивание…" if self.dl_busy else "Скачать свежий zapret", self._download, "dl", "ghost", 9)
         c2 = c1 + 170 + 14
         self.card(x1, c2, x2, c2 + 112)
         self.txt(x1 + 22, c2 + 16, "Стратегия", 11, INK, True)
@@ -554,6 +567,187 @@ class App(GfxMixin, tk.Tk):
         self.button(x1 + 22, c2 + 64, x1 + 330, c2 + 96, label + "  ▾", self._strategy_menu, "smenu", "ghost", 9)
         self.txt(x1, y2 - 18, "Приложение не изменяет файлы в папке zapret (кроме создания *-user.txt, если их нет).",
                  9, INK5)
+
+    # ── Диагностика ─────────────────────────────────────────────────────
+    STATUS_COL = {"ok": OK, "warn": WARN, "fail": DANGER, "info": ACCENT}
+
+    def _wrap(self, s, size, maxw, maxlines=2):
+        words, lines, cur = s.split(), [], ""
+        for w in words:
+            t = (cur + " " + w).strip()
+            if self.measure(t, size) <= maxw:
+                cur = t
+            else:
+                lines.append(cur)
+                cur = w
+        lines.append(cur)
+        if len(lines) > maxlines:
+            lines = lines[:maxlines]
+            lines[-1] = self.fit(lines[-1] + " …", size, maxw)
+        return [ln for ln in lines if ln]
+
+    def _page_diag(self, x1, y1, x2, y2):
+        self._header(x1, y1, x2, "Диагностика", "Права, файлы, антивирус, драйвер и сеть — и что именно мешает")
+        if self.diag_running:
+            self.button(x2 - 170, y1 + 2, x2, y1 + 34, "Идёт проверка…", lambda: None, "dg_run", "ghost", 9)
+        else:
+            self.button(x2 - 170, y1 + 2, x2, y1 + 34, "Запустить", self._run_diag, "dg_run", "primary", 10)
+            if self.diag_items:
+                self.button(x2 - 350, y1 + 2, x2 - 182, y1 + 34, "Копировать отчёт", self._copy_report,
+                            "dg_copy", "ghost", 9)
+        by1, by2 = y1 + 62, y1 + 62 + 76
+        v = self.diag_verdict
+        if self.diag_running:
+            self.card(x1, by1, x2, by2, fill=mix(C_CARD, ACCENT_FILL, 0.08), r=14)
+            ph = time.perf_counter()
+            for k in range(3):
+                a = (math.sin(ph * 5 - k * 0.7) + 1) / 2
+                self.ell(x1 + 30 + k * 14, (by1 + by2) / 2, 3 + a * 2, mix(C_CARD, ACCENT, 0.4 + 0.6 * a))
+            self.txt(x1 + 82, by1 + 22, "Идёт проверка", 12, INK, True)
+            self.txt(x1 + 82, by1 + 46, self.fit(self.diag_stage, 10, x2 - x1 - 110), 10, INK4)
+        elif v is not None:
+            c = self.STATUS_COL[v.status]
+            self.rr(x1, by1, x2, by2, 14, mix(C_CARD, c, 0.12), mix(C_CARD, c, 0.45))
+            self.ell(x1 + 28, by1 + 26, 6, c)
+            self.glow(x1 + 28, by1 + 26, 16, c, 0.35, 1.8)
+            self.txt(x1 + 48, by1 + 14, self.fit(v.title, 12, x2 - x1 - 70, True), 12, INK, True)
+            for k, ln in enumerate(self._wrap(v.detail, 9, x2 - x1 - 70, 3)):
+                self.txt(x1 + 48, by1 + 38 + k * 15, ln, 9, INK3)
+        else:
+            self.card(x1, by1, x2, by2, r=14)
+            self.txt(x1 + 22, by1 + 18, "Нажмите «Запустить»", 12, INK, True)
+            self.txt(x1 + 22, by1 + 44, "Проверю права администратора, файлы zapret, антивирус, драйвер WinDivert,\n"
+                                        "конфликтующие программы и сеть — и подскажу, что исправить.", 9, INK4)
+            return
+        # список проверок
+        ly = by2 + 14
+        items = self.diag_items
+        yy, shown, first = ly, 0, min(self.diag_off, max(0, len(items) - 1))
+        for it in items[first:]:
+            dl = self._wrap(it.detail, 9, x2 - x1 - 66, 2) if it.detail else []
+            h = 30 + 15 * len(dl)
+            if yy + h > y2 + 4:
+                break
+            c = self.STATUS_COL[it.status]
+            self.ell(x1 + 12, yy + 12, 4.5, c)
+            self.txt(x1 + 30, yy + 4, self.fit(it.title, 10, x2 - x1 - 66, True), 10, INK, True)
+            for k, ln in enumerate(dl):
+                self.txt(x1 + 30, yy + 24 + k * 15, ln, 9, INK4)
+            yy += h + 6
+            shown += 1
+            self.hline(x1 + 30, x2, yy - 3, mix(MAIN_FILL, "#ffffff", 0.06))
+        if len(items) > shown + first or first > 0:
+            tot = max(1, len(items))
+            th = max(24, (y2 - ly) * shown / tot)
+            ty = ly + (y2 - ly - th) * (first / max(1, tot - shown))
+            self.rr(x2 - 4, ty, x2, ty + th, 2, mix(MAIN_FILL, ACCENT, 0.5))
+
+    def _wheel(self, e):
+        if self.page == "diag" and self.diag_items:
+            self.diag_off = max(0, min(len(self.diag_items) - 1, self.diag_off + (-1 if e.delta > 0 else 1)))
+            self.dirty = True
+
+    def _run_diag(self):
+        if self.diag_running:
+            return
+        self.diag_items, self.diag_verdict, self.diag_off = [], None, 0
+        self.diag_running, self.diag_stage = True, "Подготовка…"
+        self.toast("Диагностика запущена", "info", key="diag", sticky=True,
+                   sub="Проверяю права, файлы, антивирус и сеть")
+        self.dirty = True
+
+        def work():
+            try:
+                v = diag.run(engine.zapret_dir(), self.winws, lambda it: self.q.put(("diag_item", it)),
+                             lambda s: self.q.put(("diag_stage", s)))
+            except Exception as e:  # noqa: BLE001
+                v = diag.Item("fail", "Ошибка диагностики", str(e))
+            self.q.put(("diag_done", v))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _copy_report(self):
+        text = diag.report_text(self.diag_items, self.diag_verdict or diag.Item("info", "—"))
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.toast("Отчёт скопирован", "ok", sub="Вставьте его в сообщение, чтобы показать разработчику")
+
+    # ── Плашки-уведомления ──────────────────────────────────────────────
+    TOAST_COL = {"info": ACCENT, "ok": OK, "error": DANGER, "warn": WARN}
+
+    def toast(self, msg, kind="info", key=None, sticky=False, sub="", dur=4.5):
+        self.q.put(("toast", msg, kind, key, sticky, sub, dur))
+
+    def toast_end(self, key, msg=None, kind=None, sub="", dur=4.5):
+        self.q.put(("toast_end", key, msg, kind, sub, dur))
+
+    def _add_toast(self, msg, kind, key, sticky, sub, dur):
+        now = time.perf_counter()
+        t = next((x for x in self.toasts if key and x["key"] == key), None)
+        if t:
+            t.update(msg=msg, kind=kind, sub=sub, sticky=sticky, out=None,
+                     until=None if sticky else now + dur)
+        else:
+            self.toasts.append(dict(key=key, msg=msg, kind=kind, sub=sub, sticky=sticky, t0=now, out=None,
+                                    until=None if sticky else now + dur))
+
+    def _end_toast(self, key, msg, kind, sub, dur):
+        t = next((x for x in self.toasts if x["key"] == key), None)
+        if not t:
+            if msg:
+                self._add_toast(msg, kind or "info", key, False, sub, dur)
+            return
+        if msg:
+            t["msg"] = msg
+        if kind:
+            t["kind"] = kind
+        t["sub"], t["sticky"] = sub, False
+        t["until"] = time.perf_counter() + dur
+
+    def _dismiss_toast(self, t):
+        if t["out"] is None:
+            t["out"] = time.perf_counter()
+            self.dirty = True
+
+    def _draw_toasts(self, now, W):
+        """Плашки в правом нижнем углу, стопкой снизу вверх."""
+        H = self.size[1] / self.S
+        keep, y = [], 0.0   # y — накопленная высота стопки снизу
+        for t in self.toasts:
+            if t["out"] is None and t["until"] is not None and now > t["until"]:
+                t["out"] = now
+            age = ease_out((now - t["t0"]) / 0.32)
+            leave = ease_out((now - t["out"]) / 0.30) if t["out"] is not None else 0.0
+            if leave >= 1.0:
+                continue
+            keep.append(t)
+            a = q(age * (1 - leave), 8)
+            off = (1 - age) * 18 + leave * 10          # выезжает снизу, уходит вниз
+            c = self.TOAST_COL.get(t["kind"], ACCENT)
+            w = max(270, min(430, max(self.measure(t["msg"], 10, True), self.measure(t["sub"], 9)) + 84))
+            h = 60 if t["sub"] else 46
+            x2 = W - 32
+            x1 = x2 - w
+            yy = H - 30 - h - y + off
+            if a > 0.01:
+                self.rr(x1 - 2, yy + 3, x2 + 2, yy + h + 7, 16, ("#000000", 0.30 * a))
+                self.rr(x1, yy, x2, yy + h, 14, (mix(C_CARD, "#2a2050", 0.45), 0.97 * a), (mix(C_CARD, c, 0.55), a))
+                self.rr(x1 + 1, yy + 12, x1 + 4, yy + h - 12, 2, (c, a))
+                if t["sticky"]:   # «загрузчик» из трёх точек
+                    for k in range(3):
+                        ph = (math.sin(now * 6 - k * 0.8) + 1) / 2
+                        self.ell(x1 + 24 + k * 11, yy + h / 2, 2.5 + ph * 1.5, (mix(C_CARD, c, 0.35 + 0.65 * ph), a))
+                    tx = x1 + 66
+                else:
+                    self.glow(x1 + 26, yy + h / 2, 15, c, 0.30 * a, 1.8)
+                    self.ell(x1 + 26, yy + h / 2, 5, (c, a))
+                    tx = x1 + 46
+                cy = yy + (18 if t["sub"] else h / 2)
+                self.txt(tx, cy, self.fit(t["msg"], 10, x2 - tx - 14, True), 10, (INK, a), True, "w")
+                if t["sub"]:
+                    self.txt(tx, yy + 40, self.fit(t["sub"], 9, x2 - tx - 14), 9, (INK3, a), False, "w")
+                self.reg(x1, yy, x2, yy + h, lambda tt=t: self._dismiss_toast(tt), "toast_" + str(id(t)))
+            y += h + 10
+        self.toasts = keep
 
     # ═══════════════════════════ взаимодействие ═══════════════════════════
     def _goto(self, k):
@@ -615,6 +809,32 @@ class App(GfxMixin, tk.Tk):
                         self.status = f"Проверяю: {a[0][2]} (лучший результат {a[0][3]})"
                 elif kind == "best":
                     self.best, self.score = a[0], (a[1], a[2])
+                elif kind == "toast":
+                    self._add_toast(*a)
+                elif kind == "toast_end":
+                    self._end_toast(*a)
+                elif kind == "dlbusy":
+                    self.dl_busy = a[0]
+                elif kind == "diag_item":
+                    self.diag_items.append(a[0])
+                    self.diag_off = max(0, len(self.diag_items) - 7)   # автопрокрутка к последним
+                elif kind == "diag_stage":
+                    self.diag_stage = a[0]
+                elif kind == "diag_done":
+                    self.diag_running, self.diag_verdict, self.diag_off = False, a[0], 0
+                    v = a[0]
+                    self.toast_end("diag", v.title, {"ok": "ok", "warn": "warn", "fail": "error"}.get(v.status, "info"),
+                                   (v.detail[:95] + "…") if len(v.detail) > 95 else v.detail, 8.0)
+                    try:
+                        Path(engine.DATA_DIR).mkdir(parents=True, exist_ok=True)
+                        (engine.DATA_DIR / "diagnostics.txt").write_text(
+                            diag.report_text(self.diag_items, v), encoding="utf-8")
+                    except OSError:
+                        pass
+                    self.log("Диагностика: " + v.title)
+                elif kind == "diag_auto":
+                    self._goto("diag")
+                    self._run_diag()
                 self.dirty = True
         except queue.Empty:
             pass
@@ -664,10 +884,19 @@ class App(GfxMixin, tk.Tk):
                 return
             if not engine.bundle_ready():
                 S(("state", True, "Скачиваю zapret…", True))
-                d = engine.download_bundle(self.log)
+                self.toast("Началась загрузка zapret…", "info", key="dl", sticky=True, sub="GitHub: Flowseal/zapret-discord-youtube")
+                d = engine.download_bundle(self.log, lambda p: self.toast(f"Скачиваю zapret… {p}%", "info", key="dl", sticky=True))
                 engine.set_zapret_dir(d)
                 self.cfg["zapret_dir"] = str(d)
                 engine.save_config(self.cfg)
+                self.toast_end("dl", "zapret загружен", "ok", str(d)[-60:])
+            miss = engine.missing_files()
+            if miss:
+                self.log("Не хватает файлов zapret: " + ", ".join(miss) + " (удалены антивирусом?)")
+                self.toast("Не хватает файлов zapret", "error", sub=", ".join(m.split("/")[-1] for m in miss)[:80], dur=7)
+                S(("state", False, "Файлы zapret повреждены"))
+                S(("diag_auto",))
+                return
             engine.ensure_user_lists()
             engine.enable_tcp_timestamps()
             strategies = engine.load_strategies()
@@ -680,6 +909,9 @@ class App(GfxMixin, tk.Tk):
                     best, total = s, len(engine.load_targets())
                     sc = engine.check_targets(engine.load_targets())
                     self.log(f"Запущена стратегия: {s.name} ({sc}/{total})")
+                elif s:
+                    self.log(f"{s.name}: не запустилась — {self.winws.last_error}")
+                    self.winws.fatal = self.winws.last_error
             else:
                 best, sc, total = engine.auto_select(
                     self.winws, strategies, self.cfg.get("best"), self.log,
@@ -688,6 +920,11 @@ class App(GfxMixin, tk.Tk):
                 if self.cancel.is_set():
                     self.log("Отменено.")
                     S(("state", False, "Отключено"))
+                elif self.winws.fatal:
+                    self.log("Причина: " + self.winws.fatal)
+                    self.toast("winws.exe не запускается", "error", sub=self.winws.fatal[:95], dur=8)
+                    S(("state", False, "winws.exe не запускается"))
+                    S(("diag_auto",))
                 else:
                     self.log("Ни одна стратегия не помогла. Включите Secure DNS в браузере, "
                              "отключите VPN/другие обходчики, проверьте антивирус.")
@@ -756,20 +993,28 @@ class App(GfxMixin, tk.Tk):
         self.dirty = True
 
     def _download(self):
-        if self.busy:
+        if self.busy or self.dl_busy:
             return
+        self.dl_busy = True
+        self.toast("Началась загрузка свежего zapret…", "info", key="dl", sticky=True,
+                   sub="GitHub: Flowseal/zapret-discord-youtube")
+        self.dirty = True
 
         def work():
             try:
                 self.winws.stop()
-                d = engine.download_bundle(self.log)
+                d = engine.download_bundle(self.log, lambda p: self.toast(
+                    f"Скачиваю zapret… {p}%", "info", key="dl", sticky=True, sub="GitHub: Flowseal/zapret-discord-youtube"))
                 engine.set_zapret_dir(d)
                 self.cfg["zapret_dir"] = str(d)
                 engine.save_config(self.cfg)
                 engine.ensure_user_lists()
                 self._refresh_set_info()
+                self.toast_end("dl", "zapret обновлён", "ok", f"Стратегий: {self.set_info['n']}", 5)
             except Exception as e:  # noqa: BLE001
                 self.log(f"Ошибка загрузки: {e}")
+                self.toast_end("dl", "Не удалось скачать zapret", "error", str(e)[:90], 8)
+            self.q.put(("dlbusy", False))
             self.q.put(("state", False, "Отключено"))
         threading.Thread(target=work, daemon=True).start()
 
