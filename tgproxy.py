@@ -33,7 +33,7 @@ TGWS_CONFIG = Path(os.environ.get("APPDATA", "")) / "TgWsProxy" / "config.json"
 
 def load_tgws_config() -> dict:
     try:
-        return json.loads(TGWS_CONFIG.read_text(encoding="utf-8"))
+        return json.loads(TGWS_CONFIG.read_text(encoding="utf-8-sig"))
     except Exception:
         return {}
 
