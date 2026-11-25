@@ -6,6 +6,7 @@
 
 - **Автоподбор стратегии.** Перебирает стратегии из [Flowseal/zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube), проверяет доступность Discord и YouTube и оставляет лучшую.
 - **Прокси для Telegram.** Ядро [Flowseal/tg-ws-proxy](https://github.com/Flowseal/tg-ws-proxy) (MTProto → WebSocket, резерв через Cloudflare). Если у вас уже есть настроенный TgWsProxy, берутся его порт и secret.
+- **Диагностика.** Вкладка проверяет права администратора, файлы zapret, антивирус (Kaspersky, Defender), драйвер WinDivert, конфликты, VPN и сеть и пишет, что именно мешает. Если `winws.exe` не стартует, причина (код ошибки Windows) видна в журнале.
 - **Оформление** в стиле [mqclass/zapret2-gui](https://github.com/mqclass/zapret2-gui): фиолетово-чёрное «стекло», плавные анимации, сглаженная графика (Pillow).
 
 ## Использование
@@ -31,6 +32,7 @@
 | `app.py` | интерфейс и анимации |
 | `gfx.py` | сглаженная графика (спрайты, свечения, твины) |
 | `engine.py` | загрузка zapret, разбор стратегий из `.bat`, автоподбор |
+| `diag.py` | диагностика: поиск причины, почему обход не запускается |
 | `tgproxy.py` | обёртка над ядром tg-ws-proxy (`proxy/`) |
 | `make_icon.py` | генерация иконки |
 
