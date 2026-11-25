@@ -36,7 +36,7 @@ _zdir: Path = DOWNLOAD_DIR
 # ------------------------------------------------------------------ конфиг
 def load_config() -> dict:
     try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))   # sig — терпим BOM
     except Exception:
         return {}
 
@@ -78,7 +78,35 @@ def _http_get(url: str, timeout=30) -> bytes:
         return r.read()
 
 
-def download_bundle(log: Log) -> Path:
+def _http_download(url: str, progress: Optional[Callable[[int], None]] = None, timeout=60) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": "ZapretOneClick"})
+    data = bytearray()
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        total = int(r.headers.get("Content-Length") or 0)
+        last = -1
+        while True:
+            chunk = r.read(65536)
+            if not chunk:
+                break
+            data += chunk
+            if progress and total:
+                pct = len(data) * 100 // total
+                if pct != last:
+                    last = pct
+                    progress(pct)
+    return bytes(data)
+
+
+REQUIRED_FILES = ["bin/winws.exe", "bin/WinDivert.dll", "bin/WinDivert64.sys", "bin/cygwin1.dll"]
+
+
+def missing_files(root: Optional[Path] = None) -> List[str]:
+    """Обязательные файлы zapret, которых нет (или они пустые) — часто их удаляет антивирус."""
+    root = root or _zdir
+    return [f for f in REQUIRED_FILES if not (root / f).exists() or (root / f).stat().st_size == 0]
+
+
+def download_bundle(log: Log, progress: Optional[Callable[[int], None]] = None) -> Path:
     """Скачивает последний релиз Flowseal/zapret-discord-youtube в DOWNLOAD_DIR."""
     log("Ищу последний релиз zapret-discord-youtube…")
     rel = json.loads(_http_get(f"https://api.github.com/repos/{REPO}/releases/latest"))
@@ -89,7 +117,7 @@ def download_bundle(log: Log) -> Path:
     tmp = Path(tempfile.mkdtemp(prefix="zoc_"))
     try:
         zpath = tmp / "bundle.zip"
-        zpath.write_bytes(_http_get(asset["browser_download_url"], timeout=120))
+        zpath.write_bytes(_http_download(asset["browser_download_url"], progress, timeout=120))
         ex = tmp / "x"
         with zipfile.ZipFile(zpath) as z:
             for m in z.namelist():
@@ -230,23 +258,84 @@ def enable_tcp_timestamps():
                    capture_output=True, creationflags=NO_WINDOW)
 
 
+WIN_ERRORS = {
+    2: "не найден файл (WinDivert64.sys или другая часть zapret удалена — чаще всего антивирусом)",
+    3: "не найден путь (папка zapret повреждена)",
+    5: "отказано в доступе (нет прав администратора или блокирует антивирус)",
+    87: "неверный параметр (стратегия не подходит этой версии winws)",
+    193: "файл повреждён или не подходит для этой Windows (нужна 64-бит Windows 10/11)",
+    225: "антивирус заблокировал файл как вирус",
+    577: "Windows блокирует драйвер WinDivert (подпись драйвера / Secure Boot / изоляция ядра / антивирус)",
+    740: "нужны права администратора",
+    1058: "служба WinDivert отключена",
+    1060: "служба WinDivert не установлена",
+    1275: "драйвер заблокирован Windows (изоляция ядра «Целостность памяти») или антивирусом",
+    1450: "не хватает системных ресурсов для драйвера",
+}
+NT_CODES = {
+    0xC0000135: "не найдена DLL (WinDivert.dll или cygwin1.dll удалены антивирусом)",
+    0xC000007B: "несовместимая разрядность (нужна 64-бит Windows)",
+    0xC0000142: "не удалось инициализировать DLL (блокировка антивирусом)",
+    0xC0000005: "аварийное завершение (возможно, вмешивается антивирус)",
+    0xC0000022: "доступ запрещён (антивирус или права)",
+}
+
+
+def explain_failure(exit_code: Optional[int], output: str = "", exc: Optional[BaseException] = None) -> str:
+    """Человеческое объяснение, почему winws.exe не запустился."""
+    if exc is not None:
+        we = getattr(exc, "winerror", None)
+        base = WIN_ERRORS.get(we, str(exc))
+        return f"не удалось запустить winws.exe: {base}" + (f" [код {we}]" if we else "")
+    m = re.search(r"(?:win ?error|error code|GetLastError\(\)|error)\D{0,6}(\d{1,5})", output, re.I)
+    if m and int(m.group(1)) in WIN_ERRORS:
+        n = int(m.group(1))
+        return f"{WIN_ERRORS[n]} [код {n}]"
+    if exit_code is not None and (exit_code & 0xFFFFFFFF) in NT_CODES:
+        return f"{NT_CODES[exit_code & 0xFFFFFFFF]} [0x{exit_code & 0xFFFFFFFF:08X}]"
+    out = " ".join(output.split())[:160]
+    return f"winws.exe завершился с кодом {exit_code}" + (f": {out}" if out else " без сообщений")
+
+
 class Winws:
     def __init__(self):
         self.proc: Optional[subprocess.Popen] = None
         self.strategy: Optional[Strategy] = None
+        self.last_error = ""
+        self.fatal = ""
+        self._out: List[str] = []
+
+    def _drain(self, proc: subprocess.Popen):
+        try:
+            for raw in proc.stdout:
+                self._out.append(raw.decode("utf-8", "replace").rstrip())
+                del self._out[:-80]
+        except Exception:
+            pass
 
     def start(self, s: Strategy) -> bool:
         self.stop()
+        self.last_error, self._out = "", []
         exe = _zdir / "bin" / "winws.exe"
-        try:
-            self.proc = subprocess.Popen([str(exe)] + s.args, cwd=str(exe.parent),
-                                         creationflags=NO_WINDOW,
-                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except OSError:
-            self.proc = None
+        if not exe.exists():
+            self.last_error = "winws.exe отсутствует в папке zapret (удалён антивирусом?)"
             return False
-        time.sleep(2.0)
-        if self.proc.poll() is not None:
+        try:
+            proc = subprocess.Popen([str(exe)] + s.args, cwd=str(exe.parent), creationflags=NO_WINDOW,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        except OSError as e:
+            self.proc = None
+            self.last_error = explain_failure(None, exc=e)
+            return False
+        self.proc = proc
+        threading.Thread(target=self._drain, args=(proc,), daemon=True).start()
+        for _ in range(10):                      # даём 2 секунды, но выходим сразу, если процесс упал
+            time.sleep(0.2)
+            if proc.poll() is not None:
+                break
+        if proc.poll() is not None:
+            time.sleep(0.15)                     # дочитать вывод
+            self.last_error = explain_failure(proc.returncode, "\n".join(self._out))
             self.proc = None
             return False
         self.strategy = s
@@ -289,14 +378,23 @@ def auto_select(winws: Winws, strategies: List[Strategy], preferred: Optional[st
     total = len(targets)
     order = sorted(strategies, key=lambda s: s.name != preferred)  # сохранённая — первой
     best, best_score = None, -1
+    winws.fatal = ""
+    fails: List[str] = []
     for i, s in enumerate(order, 1):
         if cancel.is_set():
             winws.stop()
             return None, 0, total
         progress(i - 1, len(order), s.name, max(best_score, 0))
         if not winws.start(s):
-            log(f"[{i}/{len(order)}] {s.name}: не запустилась")
+            log(f"[{i}/{len(order)}] {s.name}: не запустилась — {winws.last_error}")
+            fails.append(winws.last_error)
+            # одна и та же причина у первых трёх — дальше перебирать бессмысленно (проблема не в стратегии)
+            if best is None and len(fails) >= 3 and len(set(fails[-3:])) == 1:
+                winws.fatal = fails[-1]
+                log("winws.exe не запускается ни с одной стратегией — перебор остановлен.")
+                break
             continue
+        fails.clear()
         score = check_targets(targets)
         log(f"[{i}/{len(order)}] {s.name}: {score}/{total}")
         if score > best_score:
