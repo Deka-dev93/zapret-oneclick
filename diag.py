@@ -275,6 +275,19 @@ def check_internet() -> Item:
     return Item(FAIL, "Нет доступа в интернет", "не открывается даже cloudflare.com — проверьте подключение")
 
 
+def check_big() -> List[Item]:
+    """Крупные загрузки: видео — это большие потоки, страница может открываться, а они зависать."""
+    res = engine.probe_big()
+    items = []
+    for title, ok, detail in res:
+        items.append(Item(OK if ok else WARN, title, detail))
+    if not all(r[1] for r in res):
+        items.append(Item(INFO, "Что делать, если видео не грузится",
+                          "смените стратегию вручную (Настройки → Стратегия), отключите QUIC в браузере "
+                          "(chrome://flags/#enable-quic), добавьте домены YouTube в «Свои домены» (Настройки)"))
+    return items
+
+
 def check_baseline() -> Item:
     tg = engine.load_targets() if engine.bundle_ready() else engine.DEFAULT_TARGETS
     n = engine.check_targets(tg)
@@ -316,6 +329,8 @@ def run(zdir: Path, running: Optional[engine.Winws], emit: Callable[[Item], None
     add(check_internet())
     add(check_dns())
     add(check_baseline())
+    stage("Крупные загрузки YouTube (видео)…")
+    add(check_big())
 
     fails = [r for r in results if r.status == FAIL]
     warns = [r for r in results if r.status == WARN]
