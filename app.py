@@ -543,6 +543,7 @@ class App(GfxMixin, tk.Tk):
             "mode": engine.game_filter()[0] if ok else "—",
             "n": len(engine.load_strategies()) if ok else 0,
             "targets": len(engine.load_targets()) if ok else 0,
+            "user_n": len(engine.user_domains()) if ok else 0,
         }
 
     def _page_set(self, x1, y1, x2, y2):
@@ -564,8 +565,17 @@ class App(GfxMixin, tk.Tk):
         self.txt(x1 + 22, c2 + 16, "Стратегия", 11, INK, True)
         self.txt(x1 + 22, c2 + 40, "Авто — перебор всех и выбор лучшей по проверке Discord/YouTube", 9, INK4)
         label = "Авто (лучшая)" if self.choice == "auto" else self.choice
-        self.button(x1 + 22, c2 + 64, x1 + 330, c2 + 96, label + "  ▾", self._strategy_menu, "smenu", "ghost", 9)
-        self.txt(x1, y2 - 18, "Приложение не изменяет файлы в папке zapret (кроме создания *-user.txt, если их нет).",
+        self.button(x1 + 22, c2 + 64, x1 + 330, c2 + 96, label + "  ˅", self._strategy_menu, "smenu", "ghost", 9)
+        c3 = c2 + 112 + 14
+        self.card(x1, c3, x2, c3 + 112)
+        self.txt(x1 + 22, c3 + 16, "Свои домены", 11, INK, True)
+        n = info.get("user_n", 0)
+        self.txt(x1 + 22, c3 + 40, f"Добавлено доменов: {n}. Нужны, если часть видео или каналов YouTube не грузится "
+                                   "(файл lists\\list-general-user.txt)", 9, INK4)
+        self.button(x1 + 22, c3 + 64, x1 + 250, c3 + 96, "Добавить домены YouTube", self._add_yt_domains,
+                    "yt_add", "primary", 9)
+        self.button(x1 + 262, c3 + 64, x1 + 440, c3 + 96, "Открыть список", self._open_user_list, "yt_open", "ghost", 9)
+        self.txt(x1, y2 - 18, "Приложение меняет в папке zapret только *-user.txt (по вашей кнопке или при отсутствии файла).",
                  9, INK5)
 
     # ── Диагностика ─────────────────────────────────────────────────────
@@ -1017,6 +1027,41 @@ class App(GfxMixin, tk.Tk):
             self.q.put(("dlbusy", False))
             self.q.put(("state", False, "Отключено"))
         threading.Thread(target=work, daemon=True).start()
+
+    def _add_yt_domains(self):
+        if not engine.is_zapret_dir(engine.zapret_dir()):
+            self.toast("Папка zapret не найдена", "error", sub="Выберите папку или скачайте zapret выше")
+            return
+        try:
+            new = engine.add_user_domains(engine.YT_DOMAINS)
+        except OSError as e:
+            self.toast("Не удалось записать список", "error", sub=str(e)[:90], dur=7)
+            return
+        self._refresh_set_info()
+        if not new:
+            self.toast("Домены YouTube уже добавлены", "info", sub="list-general-user.txt")
+            return
+        self.log("В list-general-user.txt добавлено: " + ", ".join(new))
+        if self.on and not self.busy and self.winws.strategy is not None:
+            strat = self.winws.strategy
+            self.toast(f"Добавлено доменов: {len(new)}", "ok", key="yt", sticky=True, sub="Перезапускаю обход…")
+
+            def work():
+                ok = self.winws.start(strat)
+                self.toast_end("yt", "Обход перезапущен" if ok else "Не удалось перезапустить обход",
+                               "ok" if ok else "error", "" if ok else self.winws.last_error[:90], 5)
+            threading.Thread(target=work, daemon=True).start()
+        else:
+            self.toast(f"Добавлено доменов: {len(new)}", "ok", sub="Вступит в силу при следующем включении обхода")
+
+    def _open_user_list(self):
+        p = engine.user_list_path()
+        try:
+            if not p.exists():
+                engine.ensure_user_lists()
+            os.startfile(str(p))
+        except OSError as e:
+            self.toast("Не удалось открыть файл", "error", sub=str(e)[:90])
 
     def _strategy_menu(self):
         m = tk.Menu(self, tearoff=0, bg=C_CARD, fg=INK2, activebackground=ACCENT_FILL,
