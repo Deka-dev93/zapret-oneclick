@@ -95,6 +95,33 @@ def check_files(zdir: Path) -> Item:
     return Item(OK, "Файлы zapret на месте", f"winws.exe, WinDivert, cygwin1.dll; стратегий: {n}")
 
 
+LIST_FILES = ["list-general.txt", "list-general-user.txt", "list-exclude.txt", "list-exclude-user.txt",
+              "list-google.txt", "ipset-all.txt", "ipset-exclude.txt", "ipset-exclude-user.txt"]
+
+
+def check_lists(zdir: Path) -> Item:
+    """winws читает списки при старте; если файла нет/он пустой/нечитаемый — завершается с ошибкой."""
+    lists = zdir / "lists"
+    if not lists.exists():
+        return Item(FAIL, "Нет папки lists", f"{lists} — скачайте zapret заново (Настройки → Скачать свежий zapret)")
+    bad = []
+    for name in LIST_FILES:
+        p = lists / name
+        try:
+            if not p.exists():
+                bad.append(f"{name} (нет файла)")
+            elif p.stat().st_size == 0 and name != "ipset-all.txt":
+                bad.append(f"{name} (пустой)")
+            else:
+                p.read_bytes()[:1]
+        except OSError as e:
+            bad.append(f"{name} ({e.strerror or 'не читается'})")
+    if bad:
+        return Item(FAIL, "Проблема со списками доменов", "; ".join(bad) +
+                    ". winws.exe не стартует без них. Скачайте zapret заново или восстановите файлы из карантина антивируса")
+    return Item(OK, "Списки доменов на месте", f"{len(LIST_FILES)} файлов в lists\\ читаются")
+
+
 def check_bfe() -> Item:
     st = _service_state("BFE")
     if st == "RUNNING":
@@ -252,6 +279,7 @@ def run(zdir: Path, running: Optional[engine.Winws], emit: Callable[[Item], None
     stage("Файлы zapret…")
     add(check_path(zdir))
     add(check_files(zdir))
+    add(check_lists(zdir))
     stage("Службы и конфликты…")
     add(check_bfe())
     add(check_conflicts())
