@@ -297,14 +297,65 @@ def explain_failure(exit_code: Optional[int], output: str = "", exc: Optional[Ba
     lines = [ln.strip() for ln in output.splitlines() if ln.strip()]
     tail = " | ".join(lines[-3:])[-260:]
     low = output.lower()
+    last2 = " ".join(lines[-2:]).lower()
     hint = ""
-    if re.search(r"hostlist|ipset", low) and re.search(r"fail|error|cannot|can't|not found|unable", " ".join(lines[-4:]).lower()):
+    if re.search(r"hostlist|ipset|list", last2) and re.search(r"fail|error|cannot|can't|not found|unable|no such", last2):
         hint = ("winws не смог прочитать список доменов/IP из папки lists. Проверьте, что lists\\ на месте, "
                 "в пути нет кириллицы, и добавьте папку в исключения антивируса. ")
     elif "windivert" in low:
         hint = "ошибка драйвера WinDivert (права, антивирус, изоляция ядра или конфликт с другим обходчиком). "
+    elif lines and re.match(r"(loaded|loading|we have|github version|using)", lines[-1].lower()):
+        hint = ("Процесс закрылся сразу после загрузки списков, без сообщения об ошибке — обычно это значит, "
+                "что не загрузился драйвер WinDivert: его блокирует антивирус или изоляция ядра, либо в системе "
+                "остался драйвер WinDivert от другой программы. ")
     return (f"winws.exe завершился с кодом {exit_code}. {hint}" +
             (f"Последние строки вывода: {tail}" if tail else "Вывода нет")).strip()
+
+
+def _sc(args: List[str]) -> tuple[int, str]:
+    r = subprocess.run(["sc"] + args, capture_output=True, creationflags=NO_WINDOW)
+    return r.returncode, r.stdout.decode("oem", "replace")
+
+
+def process_running(name: str) -> bool:
+    r = subprocess.run(["tasklist", "/fi", f"imagename eq {name}", "/nh"], capture_output=True,
+                       creationflags=NO_WINDOW)
+    return name.lower() in r.stdout.decode("oem", "replace").lower()
+
+
+def driver_service_path(name: str) -> Optional[str]:
+    """Путь .sys, на который указывает служба драйвера (None — службы нет)."""
+    rc, out = _sc(["qc", name])
+    if rc != 0:
+        return None
+    m = re.search(r"[A-Za-z]:\\[^\r\n]*?\.sys", out, re.I)
+    return m.group(0).strip() if m else ""
+
+
+def reset_driver_services() -> List[str]:
+    """Убирает «зависшие» службы драйвера WinDivert (как Remove Services в service.bat):
+    останавливает, если winws не работает, и удаляет, если служба указывает на чужой/отсутствующий файл."""
+    actions: List[str] = []
+    ours = (_zdir / "bin" / "WinDivert64.sys")
+    busy = process_running("winws.exe")
+    for name in ("WinDivert", "WinDivert14"):
+        path = driver_service_path(name)
+        if path is None:
+            continue
+        rc, st = _sc(["query", name])
+        if "RUNNING" in st and not busy:
+            _sc(["stop", name])
+            actions.append(f"остановлена служба драйвера {name} (осталась от прошлого запуска)")
+            time.sleep(0.4)
+        if path and not busy:
+            try:
+                same = Path(path).resolve() == ours.resolve()
+            except OSError:
+                same = False
+            if not same:
+                _sc(["delete", name])
+                actions.append(f"удалена служба {name}, указывавшая на другой файл: {path}")
+    return actions
 
 
 class Winws:
@@ -313,6 +364,8 @@ class Winws:
         self.strategy: Optional[Strategy] = None
         self.last_error = ""
         self.fatal = ""
+        self.notes: List[str] = []
+        self._drv_done = False
         self._out: List[str] = []
 
     def _drain(self, proc: subprocess.Popen):
@@ -326,6 +379,12 @@ class Winws:
     def start(self, s: Strategy) -> bool:
         self.stop()
         self.last_error, self._out = "", []
+        if not self._drv_done:       # один раз за сеанс чистим «залипший» драйвер WinDivert
+            self._drv_done = True
+            try:
+                self.notes += reset_driver_services()
+            except Exception:  # noqa: BLE001
+                pass
         exe = _zdir / "bin" / "winws.exe"
         if not exe.exists():
             self.last_error = "winws.exe отсутствует в папке zapret (удалён антивирусом?)"
@@ -395,7 +454,11 @@ def auto_select(winws: Winws, strategies: List[Strategy], preferred: Optional[st
             winws.stop()
             return None, 0, total
         progress(i - 1, len(order), s.name, max(best_score, 0))
-        if not winws.start(s):
+        started = winws.start(s)
+        for note in winws.notes:
+            log("Драйвер: " + note)
+        winws.notes.clear()
+        if not started:
             log(f"[{i}/{len(order)}] {s.name}: не запустилась — {winws.last_error}")
             fails.append(winws.last_error)
             # одна и та же причина у первых трёх — дальше перебирать бессмысленно (проблема не в стратегии)
