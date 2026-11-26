@@ -287,14 +287,24 @@ def explain_failure(exit_code: Optional[int], output: str = "", exc: Optional[Ba
         we = getattr(exc, "winerror", None)
         base = WIN_ERRORS.get(we, str(exc))
         return f"не удалось запустить winws.exe: {base}" + (f" [код {we}]" if we else "")
-    m = re.search(r"(?:win ?error|error code|GetLastError\(\)|error)\D{0,6}(\d{1,5})", output, re.I)
-    if m and int(m.group(1)) in WIN_ERRORS:
+    for m in re.finditer(r"(?:win(?:dows)? ?error|error code|GetLastError\(\)|error)\D{0,6}(\d{1,5})", output, re.I):
         n = int(m.group(1))
-        return f"{WIN_ERRORS[n]} [код {n}]"
+        if n in WIN_ERRORS:
+            return f"{WIN_ERRORS[n]} [код {n}]"
     if exit_code is not None and (exit_code & 0xFFFFFFFF) in NT_CODES:
         return f"{NT_CODES[exit_code & 0xFFFFFFFF]} [0x{exit_code & 0xFFFFFFFF:08X}]"
-    out = " ".join(output.split())[:160]
-    return f"winws.exe завершился с кодом {exit_code}" + (f": {out}" if out else " без сообщений")
+    # настоящая причина идёт в КОНЦЕ вывода — берём последние строки, а не начало
+    lines = [ln.strip() for ln in output.splitlines() if ln.strip()]
+    tail = " | ".join(lines[-3:])[-260:]
+    low = output.lower()
+    hint = ""
+    if re.search(r"hostlist|ipset", low) and re.search(r"fail|error|cannot|can't|not found|unable", " ".join(lines[-4:]).lower()):
+        hint = ("winws не смог прочитать список доменов/IP из папки lists. Проверьте, что lists\\ на месте, "
+                "в пути нет кириллицы, и добавьте папку в исключения антивируса. ")
+    elif "windivert" in low:
+        hint = "ошибка драйвера WinDivert (права, антивирус, изоляция ядра или конфликт с другим обходчиком). "
+    return (f"winws.exe завершился с кодом {exit_code}. {hint}" +
+            (f"Последние строки вывода: {tail}" if tail else "Вывода нет")).strip()
 
 
 class Winws:
