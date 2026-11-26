@@ -438,13 +438,110 @@ def check_targets(targets: List[str]) -> int:
         return sum(ex.map(_probe, targets))
 
 
+# ── «тяжёлая» проверка: крупные файлы и зависание передачи на 16–20 КБ ───────
+def _curl_stat(args: List[str], timeout: int) -> dict:
+    """Запуск curl со статистикой: код возврата, HTTP-код, байты, скорость, время."""
+    try:
+        r = subprocess.run(["curl.exe", "-s", "-o", "NUL", "-m", str(timeout), "--connect-timeout", "4",
+                            "-w", "%{http_code} %{size_download} %{speed_download} %{time_total}"] + args,
+                           capture_output=True, timeout=timeout + 6, creationflags=NO_WINDOW)
+        parts = r.stdout.decode("ascii", "replace").split()
+        return {"rc": r.returncode, "code": int(parts[0]) if parts else 0,
+                "size": int(float(parts[1])) if len(parts) > 1 else 0,
+                "speed": float(parts[2]) if len(parts) > 2 else 0.0,
+                "time": float(parts[3]) if len(parts) > 3 else 0.0}
+    except Exception:  # noqa: BLE001
+        return {"rc": -1, "code": 0, "size": 0, "speed": 0.0, "time": 0.0}
+
+
+def _probe_file() -> Path:
+    p = DATA_DIR / "probe64k.bin"
+    if not p.exists() or p.stat().st_size != 65536:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(os.urandom(65536))
+    return p
+
+
+def probe_big() -> List[tuple]:
+    """Возвращает [(название, ok, подробности)]. Видео — это большие потоки: страница может открываться,
+    а крупная загрузка зависает. Проверяем крупный файл с youtube.com и отправку 64 КБ на хосты Google."""
+    results: List[tuple] = []
+    page = subprocess.run(["curl.exe", "-s", "-m", "8", "--connect-timeout", "4",
+                           "https://www.youtube.com/iframe_api"], capture_output=True, creationflags=NO_WINDOW)
+    m = re.search(rb"player\\?/([0-9A-Za-z_-]{6,})", page.stdout)
+    big_url = (f"https://www.youtube.com/s/player/{m.group(1).decode()}/player_ias.vflset/en_US/base.js"
+               if m else None)
+    pf = str(_probe_file())
+
+    def big():
+        if not big_url:
+            return ("Крупный файл с youtube.com", False, "не удалось получить ссылку (YouTube недоступен)")
+        s = _curl_stat([big_url], 15)
+        ok = s["rc"] == 0 and s["code"] == 200 and s["size"] >= 800_000
+        sp = f"{s['speed'] / 1024:.0f} КБ/с, {s['size'] // 1024} КБ"
+        if ok:
+            return ("Крупный файл с youtube.com", True, f"скачан за {s['time']:.1f} с ({sp})")
+        why = "обрыв/зависание" if s["rc"] in (28, 56, 52, 18) else f"curl rc={s['rc']}, HTTP {s['code']}"
+        return ("Крупный файл с youtube.com", False, f"не скачался: {why} ({sp})")
+
+    def post(host, title):
+        s = _curl_stat(["--data-binary", f"@{pf}", f"https://{host}/"], 7)
+        ok = s["rc"] == 0
+        return (title, ok, "соединение держит 64 КБ" if ok else
+                "передача зависла на 16–20 КБ (типичный признак блокировки видеопотока)" if s["rc"] == 28
+                else f"сброс соединения (curl rc={s['rc']})")
+
+    with ThreadPoolExecutor(3) as ex:
+        futs = [ex.submit(big),
+                ex.submit(post, "redirector.googlevideo.com", "Отправка 64 КБ на googlevideo.com"),
+                ex.submit(post, "www.youtube.com", "Отправка 64 КБ на youtube.com")]
+        results = [f.result() for f in futs]
+    return results
+
+
+# ── свои домены (lists\list-general-user.txt) ────────────────────────────────
+YT_DOMAINS = ["googlevideo.com", "youtube.com", "ytimg.com", "ggpht.com", "googleusercontent.com",
+              "youtubei.googleapis.com", "youtube-nocookie.com"]
+USER_LIST_PLACEHOLDER = "domain.example.abc"
+
+
+def user_list_path() -> Path:
+    return _zdir / "lists" / "list-general-user.txt"
+
+
+def user_domains() -> List[str]:
+    try:
+        lines = user_list_path().read_text(encoding="utf-8-sig").splitlines()
+    except OSError:
+        return []
+    return [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")
+            and ln.strip() != USER_LIST_PLACEHOLDER]
+
+
+def add_user_domains(domains: List[str]) -> List[str]:
+    """Дописывает недостающие домены в list-general-user.txt. Возвращает фактически добавленные."""
+    p = user_list_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        text = p.read_text(encoding="utf-8-sig")
+    except OSError:
+        text = ""
+    have = {ln.strip().lower() for ln in text.splitlines()}
+    new = [d for d in domains if d.lower() not in have]
+    if new:
+        if text and not text.endswith("\n"):
+            text += "\n"
+        p.write_text(text + "\n".join(new) + "\n", encoding="utf-8")
+    return new
+
+
 def auto_select(winws: Winws, strategies: List[Strategy], preferred: Optional[str],
                 log: Log, progress: Callable[[int, int, str, int], None],
                 cancel: threading.Event):
     """Перебирает стратегии, выбирает лучшую по числу доступных целей и оставляет запущенной.
     Возвращает (стратегия | None, баллы, всего)."""
     targets = load_targets()
-    total = len(targets)
+    total = len(targets) + 3               # + 3 «тяжёлые» проверки (крупный файл и отправка 64 КБ)
     order = sorted(strategies, key=lambda s: s.name != preferred)  # сохранённая — первой
     best, best_score = None, -1
     winws.fatal = ""
@@ -469,7 +566,13 @@ def auto_select(winws: Winws, strategies: List[Strategy], preferred: Optional[st
             continue
         fails.clear()
         score = check_targets(targets)
-        log(f"[{i}/{len(order)}] {s.name}: {score}/{total}")
+        extra_note = ""
+        if score == len(targets):          # страницы открываются — проверяем ещё и крупные загрузки (видео)
+            big = probe_big()
+            score += sum(1 for r in big if r[1])
+            bad = [f"{r[0]}: {r[2]}" for r in big if not r[1]]
+            extra_note = ("  ✗ " + "; ".join(bad)) if bad else ""
+        log(f"[{i}/{len(order)}] {s.name}: {score}/{total}{extra_note}")
         if score > best_score:
             best, best_score = s, score
         if score == total:
