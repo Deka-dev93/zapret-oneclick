@@ -122,6 +122,27 @@ def check_lists(zdir: Path) -> Item:
     return Item(OK, "Списки доменов на месте", f"{len(LIST_FILES)} файлов в lists\\ читаются")
 
 
+def check_driver_service(zdir: Path) -> Item:
+    """Служба WinDivert от другой программы/старой копии zapret — частая причина тихого вылета winws (код 3)."""
+    ours = zdir / "bin" / "WinDivert64.sys"
+    probs = []
+    for name in ("WinDivert", "WinDivert14"):
+        path = engine.driver_service_path(name)
+        if path is None:
+            continue
+        try:
+            same = bool(path) and Path(path).resolve() == ours.resolve()
+        except OSError:
+            same = False
+        if not same:
+            probs.append(f"{name} → {path or 'путь не определён'}")
+    if probs:
+        return Item(WARN, "В системе есть служба WinDivert от другой копии/программы",
+                    "; ".join(probs) + ". Приложение уберёт её само при следующем запуске; "
+                    "вручную: sc stop WinDivert, sc delete WinDivert (и перезагрузка)")
+    return Item(OK, "Служба драйвера WinDivert", "чужих копий драйвера нет")
+
+
 def check_bfe() -> Item:
     st = _service_state("BFE")
     if st == "RUNNING":
@@ -283,6 +304,7 @@ def run(zdir: Path, running: Optional[engine.Winws], emit: Callable[[Item], None
     stage("Службы и конфликты…")
     add(check_bfe())
     add(check_conflicts())
+    add(check_driver_service(zdir))
     add(check_vpn())
     stage("Антивирус…")
     add(check_antivirus(zdir))
